@@ -91,6 +91,10 @@ void LCodeGen::FinishCode(Handle<Code> code) {
     prototype_maps_.at(i)->AddDependentCode(
         DependentCode::kPrototypeCheckGroup, code);
   }
+  for (int i = 0 ; i < transition_maps_.length(); i++) {
+    transition_maps_.at(i)->AddDependentCode(
+        DependentCode::kTransitionGroup, code);
+  }
 }
 
 
@@ -2685,12 +2689,30 @@ void LCodeGen::DoStoreContextSlot(LStoreContextSlot* instr) {
 
 void LCodeGen::DoLoadNamedField(LLoadNamedField* instr) {
   Register object = ToRegister(instr->object());
-  Register result = ToRegister(instr->result());
+  if (!FLAG_track_double_fields) {
+    ASSERT(!instr->hydrogen()->representation().IsDouble());
+  }
+  Register temp = instr->hydrogen()->representation().IsDouble()
+      ? scratch0() : ToRegister(instr->result());
   if (instr->hydrogen()->is_in_object()) {
-    __ lw(result, FieldMemOperand(object, instr->hydrogen()->offset()));
+    __ lw(temp, FieldMemOperand(object, instr->hydrogen()->offset()));
   } else {
-    __ lw(result, FieldMemOperand(object, JSObject::kPropertiesOffset));
-    __ lw(result, FieldMemOperand(result, instr->hydrogen()->offset()));
+    __ lw(temp, FieldMemOperand(object, JSObject::kPropertiesOffset));
+    __ lw(temp, FieldMemOperand(temp, instr->hydrogen()->offset()));
+  }
+
+  if (instr->hydrogen()->representation().IsDouble()) {
+    Label load_from_heap_number, done;
+    DoubleRegister result = ToDoubleRegister(instr->result());
+    FPURegister flt_scratch = double_scratch0().low();
+    __ JumpIfNotSmi(temp, &load_from_heap_number);
+    __ SmiUntag(temp);
+    __ mtc1(temp, flt_scratch);
+    __ cvt_d_w(result, flt_scratch);
+    __ Branch(&done);
+    __ bind(&load_from_heap_number);
+    __ ldc1(result, FieldMemOperand(temp, HeapNumber::kValueOffset));
+    __ bind(&done);
   }
 }
 
@@ -2832,38 +2854,6 @@ void LCodeGen::DoLoadFunctionPrototype(LLoadFunctionPrototype* instr) {
 
   // All done.
   __ bind(&done);
-}
-
-
-void LCodeGen::DoLoadElements(LLoadElements* instr) {
-  Register result = ToRegister(instr->result());
-  Register input = ToRegister(instr->object());
-  Register scratch = scratch0();
-
-  __ lw(result, FieldMemOperand(input, JSObject::kElementsOffset));
-  if (FLAG_debug_code) {
-    Label done, fail;
-    __ lw(scratch, FieldMemOperand(result, HeapObject::kMapOffset));
-    __ LoadRoot(at, Heap::kFixedArrayMapRootIndex);
-    __ Branch(USE_DELAY_SLOT, &done, eq, scratch, Operand(at));
-    __ LoadRoot(at, Heap::kFixedCOWArrayMapRootIndex);  // In the delay slot.
-    __ Branch(&done, eq, scratch, Operand(at));
-    // |scratch| still contains |input|'s map.
-    __ lbu(scratch, FieldMemOperand(scratch, Map::kBitField2Offset));
-    __ Ext(scratch, scratch, Map::kElementsKindShift,
-           Map::kElementsKindBitCount);
-    __ Branch(&fail, lt, scratch,
-              Operand(GetInitialFastElementsKind()));
-    __ Branch(&done, le, scratch,
-              Operand(TERMINAL_FAST_ELEMENTS_KIND));
-    __ Branch(&fail, lt, scratch,
-              Operand(FIRST_EXTERNAL_ARRAY_ELEMENTS_KIND));
-    __ Branch(&done, le, scratch,
-              Operand(LAST_EXTERNAL_ARRAY_ELEMENTS_KIND));
-    __ bind(&fail);
-    __ Abort("Check for fast or external elements failed.");
-    __ bind(&done);
-  }
 }
 
 
@@ -3919,15 +3909,37 @@ void LCodeGen::DoInnerAllocatedObject(LInnerAllocatedObject* instr) {
 
 
 void LCodeGen::DoStoreNamedField(LStoreNamedField* instr) {
+  Representation representation = instr->representation();
+
   Register object = ToRegister(instr->object());
   Register value = ToRegister(instr->value());
+  ASSERT(!object.is(value));
   Register scratch = scratch0();
   int offset = instr->offset();
 
-  ASSERT(!object.is(value));
+  if (FLAG_track_fields && representation.IsSmi()) {
+    __ SmiTagCheckOverflow(value, value, scratch);
+    if (!instr->hydrogen()->value()->range()->IsInSmiRange()) {
+      DeoptimizeIf(lt, instr->environment(), scratch, Operand(zero_reg));
+    }
+  } else if (FLAG_track_double_fields && representation.IsDouble() &&
+             !instr->hydrogen()->value()->type().IsSmi() &&
+             !instr->hydrogen()->value()->type().IsHeapNumber()) {
+    Label do_store;
+    __ JumpIfSmi(value, &do_store);
+    Handle<Map> map(isolate()->factory()->heap_number_map());
 
-  if (!instr->transition().is_null()) {
-    __ li(scratch, Operand(instr->transition()));
+    __ lw(scratch, FieldMemOperand(value, HeapObject::kMapOffset));
+    DoCheckMapCommon(scratch, map, REQUIRE_EXACT_MAP, instr->environment());
+    __ bind(&do_store);
+  }
+
+  Handle<Map> transition = instr->transition();
+  if (!transition.is_null()) {
+    if (transition->CanBeDeprecated()) {
+      transition_maps_.Add(transition, info()->zone());
+    }
+    __ li(scratch, Operand(transition));
     __ sw(scratch, FieldMemOperand(object, HeapObject::kMapOffset));
     if (instr->hydrogen()->NeedsWriteBarrierForMap()) {
       Register temp = ToRegister(instr->temp());
@@ -4811,6 +4823,8 @@ void LCodeGen::DoNumberUntagD(LNumberUntagD* instr) {
       } else {
         mode = NUMBER_CANDIDATE_IS_SMI;
       }
+    } else {
+      mode = NUMBER_CANDIDATE_IS_SMI;
     }
   }
 
@@ -5150,7 +5164,6 @@ void LCodeGen::DoAllocate(LAllocate* instr) {
 
 
 void LCodeGen::DoDeferredAllocate(LAllocate* instr) {
-  Register size = ToRegister(instr->size());
   Register result = ToRegister(instr->result());
 
   // TODO(3095996): Get rid of this. For now, we need to make the
@@ -5159,8 +5172,16 @@ void LCodeGen::DoDeferredAllocate(LAllocate* instr) {
   __ mov(result, zero_reg);
 
   PushSafepointRegistersScope scope(this, Safepoint::kWithRegisters);
-  __ SmiTag(size, size);
-  __ push(size);
+  if (instr->size()->IsRegister()) {
+    Register size = ToRegister(instr->size());
+    ASSERT(!size.is(result));
+    __ SmiTag(size);
+    __ push(size);
+  } else {
+    int32_t size = ToInteger32(LConstantOperand::cast(instr->size()));
+    __ Push(Smi::FromInt(size));
+  }
+
   if (instr->hydrogen()->CanAllocateInOldPointerSpace()) {
     CallRuntimeFromDeferred(
         Runtime::kAllocateInOldPointerSpace, 1, instr);
