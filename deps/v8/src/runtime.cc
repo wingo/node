@@ -2498,6 +2498,13 @@ RUNTIME_FUNCTION(MaybeObject*, Runtime_SetCode) {
     return Failure::Exception();
   }
 
+  // Mark both, the source and the target, as un-flushable because the
+  // shared unoptimized code makes them impossible to enqueue in a list.
+  ASSERT(target_shared->code()->gc_metadata() == NULL);
+  ASSERT(source_shared->code()->gc_metadata() == NULL);
+  target_shared->set_dont_flush(true);
+  source_shared->set_dont_flush(true);
+
   // Set the code, scope info, formal parameter count, and the length
   // of the target shared function info.  Set the source code of the
   // target function to undefined.  SetCode is only used for built-in
@@ -8004,7 +8011,7 @@ RUNTIME_FUNCTION(MaybeObject*, Runtime_NotifyDeoptimized) {
     Deoptimizer::DeoptimizeFunction(*function);
   }
   // Flush optimized code cache for this function.
-  function->shared()->ClearOptimizedCodeMap();
+  function->shared()->ClearOptimizedCodeMap("notify deoptimized");
 
   return isolate->heap()->undefined_value();
 }
@@ -9213,26 +9220,6 @@ RUNTIME_FUNCTION(ObjectPair, Runtime_ResolvePossiblyDirectEval) {
                            args.at<Object>(2),
                            language_mode,
                            args.smi_at(4));
-}
-
-
-RUNTIME_FUNCTION(MaybeObject*, Runtime_SetNewFunctionAttributes) {
-  // This utility adjusts the property attributes for newly created Function
-  // object ("new Function(...)") by changing the map.
-  // All it does is changing the prototype property to enumerable
-  // as specified in ECMA262, 15.3.5.2.
-  HandleScope scope(isolate);
-  ASSERT(args.length() == 1);
-  CONVERT_ARG_HANDLE_CHECKED(JSFunction, func, 0);
-
-  Handle<Map> map = func->shared()->is_classic_mode()
-      ? isolate->function_instance_map()
-      : isolate->strict_mode_function_instance_map();
-
-  ASSERT(func->map()->instance_type() == map->instance_type());
-  ASSERT(func->map()->instance_size() == map->instance_size());
-  func->set_map(*map);
-  return *func;
 }
 
 
