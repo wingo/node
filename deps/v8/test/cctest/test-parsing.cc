@@ -388,8 +388,7 @@ TEST(PreParseOverflow) {
       reinterpret_cast<uintptr_t>(&marker) - 128 * 1024);
 
   size_t kProgramSize = 1024 * 1024;
-  i::SmartArrayPointer<char> program(
-      reinterpret_cast<char*>(malloc(kProgramSize + 1)));
+  i::SmartArrayPointer<char> program(i::NewArray<char>(kProgramSize + 1));
   memset(*program, '(', kProgramSize);
   program[kProgramSize] = '\0';
 
@@ -1073,6 +1072,7 @@ enum ParserFlag {
   kAllowHarmonyScoping,
   kAllowModules,
   kAllowGenerators,
+  kAllowForOf,
   kParserFlagCount
 };
 
@@ -1089,7 +1089,8 @@ static bool checkParserFlag(unsigned flags, ParserFlag flag) {
   parser.set_allow_harmony_scoping(checkParserFlag(flags, \
                                                    kAllowHarmonyScoping)); \
   parser.set_allow_modules(checkParserFlag(flags, kAllowModules)); \
-  parser.set_allow_generators(checkParserFlag(flags, kAllowGenerators));
+  parser.set_allow_generators(checkParserFlag(flags, kAllowGenerators)); \
+  parser.set_allow_for_of(checkParserFlag(flags, kAllowForOf));
 
 void TestParserSyncWithFlags(i::Handle<i::String> source, unsigned flags) {
   uintptr_t stack_limit = i::Isolate::Current()->stack_guard()->real_climit();

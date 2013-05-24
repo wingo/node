@@ -108,10 +108,12 @@ Representation HValue::RepresentationFromUses() {
   int tagged_count = use_count[Representation::kTagged];
   int double_count = use_count[Representation::kDouble];
   int int32_count = use_count[Representation::kInteger32];
+  int smi_count = use_count[Representation::kSmi];
 
   if (tagged_count > 0) return Representation::Tagged();
   if (double_count > 0) return Representation::Double();
   if (int32_count > 0) return Representation::Integer32();
+  if (smi_count > 0) return Representation::Smi();
 
   return Representation::None();
 }
@@ -426,6 +428,8 @@ bool Range::MulAndCheckOverflow(Range* other) {
 
 
 const char* HType::ToString() {
+  // Note: The c1visualizer syntax for locals allows only a sequence of the
+  // following characters: A-Za-z0-9_-|:
   switch (type_) {
     case kTagged: return "tagged";
     case kTaggedPrimitive: return "primitive";
@@ -440,7 +444,7 @@ const char* HType::ToString() {
     case kUninitialized: return "uninitialized";
   }
   UNREACHABLE();
-  return "Unreachable code";
+  return "unreachable";
 }
 
 
@@ -648,7 +652,6 @@ void HValue::SetOperandAt(int index, HValue* value) {
 void HValue::DeleteAndReplaceWith(HValue* other) {
   // We replace all uses first, so Delete can assert that there are none.
   if (other != NULL) ReplaceAllUsesWith(other);
-  ASSERT(HasNoUses());
   Kill();
   DeleteFromGraph();
 }
@@ -694,16 +697,18 @@ void HValue::SetBlock(HBasicBlock* block) {
 
 void HValue::PrintTypeTo(StringStream* stream) {
   if (!representation().IsTagged() || type().Equals(HType::Tagged())) return;
-  stream->Add(" type[%s]", type().ToString());
+  stream->Add(" type:%s", type().ToString());
 }
 
 
 void HValue::PrintRangeTo(StringStream* stream) {
   if (range() == NULL || range()->IsMostGeneric()) return;
-  stream->Add(" range[%d,%d,m0=%d]",
+  // Note: The c1visualizer syntax for locals allows only a sequence of the
+  // following characters: A-Za-z0-9_-|:
+  stream->Add(" range:%d_%d%s",
               range()->lower(),
               range()->upper(),
-              static_cast<int>(range()->CanBeMinusZero()));
+              range()->CanBeMinusZero() ? "_m0" : "");
 }
 
 
@@ -799,6 +804,14 @@ void HInstruction::PrintTo(StringStream* stream) {
   PrintTypeTo(stream);
   if (CheckFlag(HValue::kHasNoObservableSideEffects)) {
     stream->Add(" [noOSE]");
+  }
+}
+
+
+void HInstruction::PrintDataTo(StringStream *stream) {
+  for (int i = 0; i < OperandCount(); ++i) {
+    if (i > 0) stream->Add(" ");
+    OperandAt(i)->PrintNameTo(stream);
   }
 }
 
@@ -1132,16 +1145,15 @@ void HBoundsCheck::InferRepresentation(HInferRepresentation* h_infer) {
   HValue* actual_length = length()->ActualValue();
   HValue* actual_index = index()->ActualValue();
   if (key_mode_ == DONT_ALLOW_SMI_KEY ||
-      !actual_length->representation().IsTagged()) {
+      !actual_length->representation().IsSmiOrTagged()) {
     r = Representation::Integer32();
-  } else if (actual_index->representation().IsTagged() ||
-      (actual_index->IsConstant() &&
-       HConstant::cast(actual_index)->HasSmiValue())) {
-    // If the index is tagged, or a constant that holds a Smi, allow the length
-    // to be tagged, since it is usually already tagged from loading it out of
-    // the length field of a JSArray. This allows for direct comparison without
-    // untagging.
-    r = Representation::Tagged();
+  } else if (actual_index->representation().IsSmiOrTagged() ||
+             (actual_index->IsConstant() &&
+              HConstant::cast(actual_index)->HasSmiValue())) {
+    // If the index is smi, or a constant that holds a Smi, allow the length to
+    // be smi, since it is usually already smi from loading it out of the length
+    // field of a JSArray. This allows for direct comparison without untagging.
+    r = Representation::Smi();
   } else {
     r = Representation::Integer32();
   }
@@ -1246,14 +1258,6 @@ void HControlInstruction::PrintDataTo(StringStream* stream) {
 
 void HUnaryControlInstruction::PrintDataTo(StringStream* stream) {
   value()->PrintNameTo(stream);
-  HControlInstruction::PrintDataTo(stream);
-}
-
-
-void HIsNilAndBranch::PrintDataTo(StringStream* stream) {
-  value()->PrintNameTo(stream);
-  stream->Add(kind() == kStrictEquality ? " === " : " == ");
-  stream->Add(nil() == kNullValue ? "null" : "undefined");
   HControlInstruction::PrintDataTo(stream);
 }
 
@@ -1437,6 +1441,16 @@ HValue* HSub::Canonicalize() {
 HValue* HMul::Canonicalize() {
   if (IsIdentityOperation(left(), right(), 1)) return left();
   if (IsIdentityOperation(right(), left(), 1)) return right();
+  return this;
+}
+
+
+HValue* HMod::Canonicalize() {
+  return this;
+}
+
+
+HValue* HDiv::Canonicalize() {
   return this;
 }
 
@@ -1674,10 +1688,11 @@ Range* HValue::InferRange(Zone* zone) {
 Range* HChange::InferRange(Zone* zone) {
   Range* input_range = value()->range();
   if (from().IsInteger32() &&
-      to().IsTagged() &&
+      to().IsSmiOrTagged() &&
       !value()->CheckFlag(HInstruction::kUint32) &&
       input_range != NULL && input_range->IsInSmiRange()) {
     set_type(HType::Smi());
+    ClearGVNFlag(kChangesNewSpacePromotion);
   }
   Range* result = (input_range != NULL)
       ? input_range->Copy(zone)
@@ -1768,20 +1783,22 @@ Range* HMul::InferRange(Zone* zone) {
 
 Range* HDiv::InferRange(Zone* zone) {
   if (representation().IsInteger32()) {
+    Range* a = left()->range();
+    Range* b = right()->range();
     Range* result = new(zone) Range();
-    if (left()->range()->CanBeMinusZero()) {
+    if (a->CanBeMinusZero()) {
       result->set_can_be_minus_zero(true);
     }
 
-    if (left()->range()->CanBeZero() && right()->range()->CanBeNegative()) {
+    if (a->CanBeZero() && b->CanBeNegative()) {
       result->set_can_be_minus_zero(true);
     }
 
-    if (right()->range()->Includes(-1) && left()->range()->Includes(kMinInt)) {
-      SetFlag(HValue::kCanOverflow);
+    if (!a->Includes(kMinInt) || !b->Includes(-1)) {
+      ClearFlag(HValue::kCanOverflow);
     }
 
-    if (!right()->range()->CanBeZero()) {
+    if (!b->CanBeZero()) {
       ClearFlag(HValue::kCanBeDivByZero);
     }
     return result;
@@ -1794,16 +1811,17 @@ Range* HDiv::InferRange(Zone* zone) {
 Range* HMod::InferRange(Zone* zone) {
   if (representation().IsInteger32()) {
     Range* a = left()->range();
+    Range* b = right()->range();
     Range* result = new(zone) Range();
     if (a->CanBeMinusZero() || a->CanBeNegative()) {
       result->set_can_be_minus_zero(true);
     }
 
-    if (right()->range()->Includes(-1) && left()->range()->Includes(kMinInt)) {
-      SetFlag(HValue::kCanOverflow);
+    if (!a->Includes(kMinInt) || !b->Includes(-1)) {
+      ClearFlag(HValue::kCanOverflow);
     }
 
-    if (!right()->range()->CanBeZero()) {
+    if (!b->CanBeZero()) {
       ClearFlag(HValue::kCanBeDivByZero);
     }
     return result;
@@ -1893,14 +1911,16 @@ void HPhi::PrintTo(StringStream* stream) {
     value->PrintNameTo(stream);
     stream->Add(" ");
   }
-  stream->Add(" uses%d_%di_%dd_%dt",
+  stream->Add(" uses:%d_%ds_%di_%dd_%dt",
               UseCount(),
+              smi_non_phi_uses() + smi_indirect_uses(),
               int32_non_phi_uses() + int32_indirect_uses(),
               double_non_phi_uses() + double_indirect_uses(),
               tagged_non_phi_uses() + tagged_indirect_uses());
-  stream->Add("%s%s]",
-              is_live() ? "_live" : "",
-              IsConvertibleToInteger() ? "" : "_ncti");
+  if (!IsConvertibleToInteger()) stream->Add("_ncti");
+  PrintRangeTo(stream);
+  PrintTypeTo(stream);
+  stream->Add("]");
 }
 
 
@@ -1972,8 +1992,9 @@ void HPhi::InitRealUses(int phi_id) {
 
 void HPhi::AddNonPhiUsesFrom(HPhi* other) {
   if (FLAG_trace_representation) {
-    PrintF("adding to #%d Phi uses of #%d Phi: i%d d%d t%d\n",
+    PrintF("adding to #%d Phi uses of #%d Phi: s%d i%d d%d t%d\n",
            id(), other->id(),
+           other->non_phi_uses_[Representation::kSmi],
            other->non_phi_uses_[Representation::kInteger32],
            other->non_phi_uses_[Representation::kDouble],
            other->non_phi_uses_[Representation::kTagged]);
@@ -1998,8 +2019,9 @@ void HSimulate::MergeWith(ZoneList<HSimulate*>* list) {
     ZoneList<HValue*>* from_values = &from->values_;
     for (int i = 0; i < from_values->length(); ++i) {
       if (from->HasAssignedIndexAt(i)) {
-        AddAssignedValue(from->GetAssignedIndexAt(i),
-                         from_values->at(i));
+        int index = from->GetAssignedIndexAt(i);
+        if (HasValueForIndex(index)) continue;
+        AddAssignedValue(index, from_values->at(i));
       } else {
         if (pop_count_ > 0) {
           pop_count_--;
@@ -2020,13 +2042,13 @@ void HSimulate::PrintDataTo(StringStream* stream) {
   if (values_.length() > 0) {
     if (pop_count_ > 0) stream->Add(" /");
     for (int i = values_.length() - 1; i >= 0; --i) {
-      if (i > 0) stream->Add(",");
       if (HasAssignedIndexAt(i)) {
         stream->Add(" var[%d] = ", GetAssignedIndexAt(i));
       } else {
         stream->Add(" push ");
       }
       values_[i]->PrintNameTo(stream);
+      if (i > 0) stream->Add(",");
     }
   }
 }
@@ -2464,7 +2486,7 @@ void HParameter::PrintDataTo(StringStream* stream) {
 
 void HLoadNamedField::PrintDataTo(StringStream* stream) {
   object()->PrintNameTo(stream);
-  stream->Add(" @%d%s", offset(), is_in_object() ? "[in-object]" : "");
+  access_.PrintTo(stream);
   if (HasTypeCheck()) {
     stream->Add(" ");
     typecheck()->PrintNameTo(stream);
@@ -2681,7 +2703,12 @@ bool HLoadKeyed::UsesMustHandleHole() const {
     return false;
   }
 
-  if (hole_mode() == ALLOW_RETURN_HOLE) return true;
+  if (hole_mode() == ALLOW_RETURN_HOLE) {
+    if (IsFastDoubleElementsKind(elements_kind())) {
+      return AllUsesCanTreatHoleAsNaN();
+    }
+    return true;
+  }
 
   if (IsFastDoubleElementsKind(elements_kind())) {
     return false;
@@ -2689,7 +2716,23 @@ bool HLoadKeyed::UsesMustHandleHole() const {
 
   for (HUseIterator it(uses()); !it.Done(); it.Advance()) {
     HValue* use = it.value();
-    if (!use->IsChange()) {
+    if (!use->IsChange() || !HChange::cast(use)->to().IsDouble()) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+
+bool HLoadKeyed::AllUsesCanTreatHoleAsNaN() const {
+  if (!IsFastDoubleElementsKind(elements_kind())) {
+    return false;
+  }
+
+  for (HUseIterator it(uses()); !it.Done(); it.Advance()) {
+    HValue* use = it.value();
+    if (use->CheckFlag(HValue::kDeoptimizeOnUndefined)) {
       return false;
     }
   }
@@ -2765,11 +2808,9 @@ void HStoreNamedGeneric::PrintDataTo(StringStream* stream) {
 
 void HStoreNamedField::PrintDataTo(StringStream* stream) {
   object()->PrintNameTo(stream);
-  stream->Add(".");
-  stream->Add(*String::cast(*name())->ToCString());
+  access_.PrintTo(stream);
   stream->Add(" = ");
   value()->PrintNameTo(stream);
-  stream->Add(" @%d%s", offset(), is_in_object() ? "[in-object]" : "");
   if (NeedsWriteBarrier()) {
     stream->Add(" (write-barrier)");
   }
@@ -2907,15 +2948,6 @@ HType HCheckSmi::CalculateInferredType() {
 }
 
 
-void HCheckSmiOrInt32::InferRepresentation(HInferRepresentation* h_infer) {
-  ASSERT(CheckFlag(kFlexibleRepresentation));
-  ASSERT(UseCount() == 1);
-  HUseIterator use = uses();
-  Representation r = use.value()->RequiredInputRepresentation(use.index());
-  UpdateRepresentation(r, h_infer, "checksmiorint32");
-}
-
-
 HType HPhi::CalculateInferredType() {
   HType result = HType::Uninitialized();
   for (int i = 0; i < OperandCount(); ++i) {
@@ -3005,16 +3037,6 @@ HType HAllocate::CalculateInferredType() {
 void HAllocate::PrintDataTo(StringStream* stream) {
   size()->PrintNameTo(stream);
   if (!GuaranteedInNewSpace()) stream->Add(" (pretenure)");
-}
-
-
-HType HArrayLiteral::CalculateInferredType() {
-  return HType::JSArray();
-}
-
-
-HType HObjectLiteral::CalculateInferredType() {
-  return HType::JSObject();
 }
 
 
@@ -3350,6 +3372,9 @@ HInstruction* HMod::New(
     if (c_left->HasInteger32Value() && c_right->HasInteger32Value()) {
       int32_t dividend = c_left->Integer32Value();
       int32_t divisor = c_right->Integer32Value();
+      if (dividend == kMinInt && divisor == -1) {
+        return H_CONSTANT_DOUBLE(-0.0);
+      }
       if (divisor != 0) {
         int32_t res = dividend % divisor;
         if ((res == 0) && (dividend < 0)) {
@@ -3525,6 +3550,7 @@ void HPhi::InferRepresentation(HInferRepresentation* h_infer) {
 Representation HPhi::RepresentationFromInputs() {
   bool double_occurred = false;
   bool int32_occurred = false;
+  bool smi_occurred = false;
   for (int i = 0; i < OperandCount(); ++i) {
     HValue* value = OperandAt(i);
     if (value->IsUnknownOSRValue()) {
@@ -3534,11 +3560,13 @@ Representation HPhi::RepresentationFromInputs() {
         if (hint.IsTagged()) return hint;
         if (hint.IsDouble()) double_occurred = true;
         if (hint.IsInteger32()) int32_occurred = true;
+        if (hint.IsSmi()) smi_occurred = true;
       }
       continue;
     }
     if (value->representation().IsDouble()) double_occurred = true;
     if (value->representation().IsInteger32()) int32_occurred = true;
+    if (value->representation().IsSmi()) smi_occurred = true;
     if (value->representation().IsTagged()) {
       if (value->IsConstant()) {
         HConstant* constant = HConstant::cast(value);
@@ -3558,8 +3586,8 @@ Representation HPhi::RepresentationFromInputs() {
   }
 
   if (double_occurred) return Representation::Double();
-
   if (int32_occurred) return Representation::Integer32();
+  if (smi_occurred) return Representation::Smi();
 
   return Representation::None();
 }
@@ -3635,5 +3663,142 @@ void HCheckFunction::Verify() {
 }
 
 #endif
+
+
+HObjectAccess HObjectAccess::ForFixedArrayHeader(int offset) {
+  ASSERT(offset >= 0);
+  ASSERT(offset < FixedArray::kHeaderSize);
+  if (offset == FixedArray::kLengthOffset) return ForFixedArrayLength();
+  return HObjectAccess(kInobject, offset);
+}
+
+
+HObjectAccess HObjectAccess::ForJSObjectOffset(int offset) {
+  ASSERT(offset >= 0);
+  Portion portion = kInobject;
+
+  if (offset == JSObject::kElementsOffset) {
+    portion = kElementsPointer;
+  } else if (offset == JSObject::kMapOffset) {
+    portion = kMaps;
+  }
+  return HObjectAccess(portion, offset, Handle<String>::null());
+}
+
+
+HObjectAccess HObjectAccess::ForJSArrayOffset(int offset) {
+  ASSERT(offset >= 0);
+  Portion portion = kInobject;
+
+  if (offset == JSObject::kElementsOffset) {
+    portion = kElementsPointer;
+  } else if (offset == JSArray::kLengthOffset) {
+    portion = kArrayLengths;
+  } else if (offset == JSObject::kMapOffset) {
+    portion = kMaps;
+  }
+  return HObjectAccess(portion, offset, Handle<String>::null());
+}
+
+
+HObjectAccess HObjectAccess::ForBackingStoreOffset(int offset) {
+  ASSERT(offset >= 0);
+  return HObjectAccess(kBackingStore, offset, Handle<String>::null());
+}
+
+
+HObjectAccess HObjectAccess::ForField(Handle<Map> map,
+    LookupResult *lookup, Handle<String> name) {
+  ASSERT(lookup->IsField() || lookup->IsTransitionToField(*map));
+  int index;
+  if (lookup->IsField()) {
+    index = lookup->GetLocalFieldIndexFromMap(*map);
+  } else {
+    Map* transition = lookup->GetTransitionMapFromMap(*map);
+    int descriptor = transition->LastAdded();
+    index = transition->instance_descriptors()->GetFieldIndex(descriptor) -
+        map->inobject_properties();
+  }
+  if (index < 0) {
+    // Negative property indices are in-object properties, indexed
+    // from the end of the fixed part of the object.
+    int offset = (index * kPointerSize) + map->instance_size();
+    return HObjectAccess(kInobject, offset);
+  } else {
+    // Non-negative property indices are in the properties array.
+    int offset = (index * kPointerSize) + FixedArray::kHeaderSize;
+    return HObjectAccess(kBackingStore, offset, name);
+  }
+}
+
+
+void HObjectAccess::SetGVNFlags(HValue *instr, bool is_store) {
+  // set the appropriate GVN flags for a given load or store instruction
+  if (is_store) {
+    // track dominating allocations in order to eliminate write barriers
+    instr->SetGVNFlag(kDependsOnNewSpacePromotion);
+    instr->SetFlag(HValue::kTrackSideEffectDominators);
+    instr->SetFlag(HValue::kDeoptimizeOnUndefined);
+  } else {
+    // try to GVN loads, but don't hoist above map changes
+    instr->SetFlag(HValue::kUseGVN);
+    instr->SetGVNFlag(kDependsOnMaps);
+  }
+
+  switch (portion()) {
+    case kArrayLengths:
+      instr->SetGVNFlag(is_store
+          ? kChangesArrayLengths : kDependsOnArrayLengths);
+      break;
+    case kInobject:
+      instr->SetGVNFlag(is_store
+          ? kChangesInobjectFields : kDependsOnInobjectFields);
+      break;
+    case kDouble:
+      instr->SetGVNFlag(is_store
+          ? kChangesDoubleFields : kDependsOnDoubleFields);
+      break;
+    case kBackingStore:
+      instr->SetGVNFlag(is_store
+          ? kChangesBackingStoreFields : kDependsOnBackingStoreFields);
+      break;
+    case kElementsPointer:
+      instr->SetGVNFlag(is_store
+          ? kChangesElementsPointer : kDependsOnElementsPointer);
+      break;
+    case kMaps:
+      instr->SetGVNFlag(is_store
+          ? kChangesMaps : kDependsOnMaps);
+      break;
+  }
+}
+
+
+void HObjectAccess::PrintTo(StringStream* stream) {
+  stream->Add(".");
+
+  switch (portion()) {
+    case kArrayLengths:
+      stream->Add("%length");
+      break;
+    case kElementsPointer:
+      stream->Add("%elements");
+      break;
+    case kMaps:
+      stream->Add("%map");
+      break;
+    case kDouble:  // fall through
+    case kInobject:
+      if (!name_.is_null()) stream->Add(*String::cast(*name_)->ToCString());
+      stream->Add("[in-object]");
+      break;
+    case kBackingStore:
+      if (!name_.is_null()) stream->Add(*String::cast(*name_)->ToCString());
+      stream->Add("[backing-store]");
+      break;
+  }
+
+  stream->Add("@%d", offset());
+}
 
 } }  // namespace v8::internal

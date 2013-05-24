@@ -658,28 +658,37 @@ static void ArrayBufferWeakCallback(v8::Isolate* external_isolate,
   Isolate* isolate = reinterpret_cast<Isolate*>(external_isolate);
   HandleScope scope(isolate);
   Handle<Object> internal_object = Utils::OpenHandle(**object);
+  Handle<JSArrayBuffer> array_buffer(JSArrayBuffer::cast(*internal_object));
 
-  size_t allocated_length = NumberToSize(
-      isolate, JSArrayBuffer::cast(*internal_object)->byte_length());
-  isolate->heap()->AdjustAmountOfExternalAllocatedMemory(
-      -static_cast<intptr_t>(allocated_length));
-  if (data != NULL)
+  if (!array_buffer->is_external()) {
+    size_t allocated_length = NumberToSize(
+        isolate, array_buffer->byte_length());
+    isolate->heap()->AdjustAmountOfExternalAllocatedMemory(
+        -static_cast<intptr_t>(allocated_length));
     free(data);
+  }
   object->Dispose(external_isolate);
 }
 
 
-bool Runtime::SetupArrayBuffer(Isolate* isolate,
+void Runtime::SetupArrayBuffer(Isolate* isolate,
                                Handle<JSArrayBuffer> array_buffer,
+                               bool is_external,
                                void* data,
                                size_t allocated_length) {
+  ASSERT(array_buffer->GetInternalFieldCount() ==
+      v8::ArrayBuffer::kInternalFieldCount);
+  for (int i = 0; i < v8::ArrayBuffer::kInternalFieldCount; i++) {
+    array_buffer->SetInternalField(i, Smi::FromInt(0));
+  }
   array_buffer->set_backing_store(data);
+  array_buffer->set_flag(Smi::FromInt(0));
+  array_buffer->set_is_external(is_external);
 
   Handle<Object> byte_length =
-      isolate->factory()->NewNumber(static_cast<double>(allocated_length));
+      isolate->factory()->NewNumberFromSize(allocated_length);
   CHECK(byte_length->IsSmi() || byte_length->IsHeapNumber());
   array_buffer->set_byte_length(*byte_length);
-  return true;
 }
 
 
@@ -696,8 +705,7 @@ bool Runtime::SetupArrayBufferAllocatingData(
     data = NULL;
   }
 
-  if (!SetupArrayBuffer(isolate, array_buffer, data, allocated_length))
-    return false;
+  SetupArrayBuffer(isolate, array_buffer, false, data, allocated_length);
 
   v8::Isolate* external_isolate = reinterpret_cast<v8::Isolate*>(isolate);
   v8::Persistent<v8::Value> weak_handle = v8::Persistent<v8::Value>::New(
@@ -795,51 +803,41 @@ RUNTIME_FUNCTION(MaybeObject*, Runtime_TypedArrayInitialize) {
   CONVERT_ARG_HANDLE_CHECKED(Object, byte_length_object, 4);
 
   ExternalArrayType arrayType;
-  ElementsKind elementsKind;
   size_t elementSize;
   switch (arrayId) {
     case ARRAY_ID_UINT8:
-      elementsKind = EXTERNAL_UNSIGNED_BYTE_ELEMENTS;
       arrayType = kExternalUnsignedByteArray;
       elementSize = 1;
       break;
     case ARRAY_ID_INT8:
-      elementsKind = EXTERNAL_BYTE_ELEMENTS;
       arrayType = kExternalByteArray;
       elementSize = 1;
       break;
     case ARRAY_ID_UINT16:
-      elementsKind = EXTERNAL_UNSIGNED_SHORT_ELEMENTS;
       arrayType = kExternalUnsignedShortArray;
       elementSize = 2;
       break;
     case ARRAY_ID_INT16:
-      elementsKind = EXTERNAL_SHORT_ELEMENTS;
       arrayType = kExternalShortArray;
       elementSize = 2;
       break;
     case ARRAY_ID_UINT32:
-      elementsKind = EXTERNAL_UNSIGNED_INT_ELEMENTS;
       arrayType = kExternalUnsignedIntArray;
       elementSize = 4;
       break;
     case ARRAY_ID_INT32:
-      elementsKind = EXTERNAL_INT_ELEMENTS;
       arrayType = kExternalIntArray;
       elementSize = 4;
       break;
     case ARRAY_ID_FLOAT32:
-      elementsKind = EXTERNAL_FLOAT_ELEMENTS;
       arrayType = kExternalFloatArray;
       elementSize = 4;
       break;
     case ARRAY_ID_FLOAT64:
-      elementsKind = EXTERNAL_DOUBLE_ELEMENTS;
       arrayType = kExternalDoubleArray;
       elementSize = 8;
       break;
     case ARRAY_ID_UINT8C:
-      elementsKind = EXTERNAL_PIXEL_ELEMENTS;
       arrayType = kExternalPixelArray;
       elementSize = 1;
       break;
@@ -857,16 +855,13 @@ RUNTIME_FUNCTION(MaybeObject*, Runtime_TypedArrayInitialize) {
   ASSERT(byte_length % elementSize == 0);
   size_t length = byte_length / elementSize;
 
-  Handle<Object> length_obj =
-      isolate->factory()->NewNumber(static_cast<double>(length));
+  Handle<Object> length_obj = isolate->factory()->NewNumberFromSize(length);
   holder->set_length(*length_obj);
+
   Handle<ExternalArray> elements =
       isolate->factory()->NewExternalArray(
           static_cast<int>(length), arrayType,
           static_cast<uint8_t*>(buffer->backing_store()) + byte_offset);
-  Handle<Map> map =
-      isolate->factory()->GetElementsTransitionMap(holder, elementsKind);
-  holder->set_map(*map);
   holder->set_elements(*elements);
   return isolate->heap()->undefined_value();
 }
@@ -2498,6 +2493,13 @@ RUNTIME_FUNCTION(MaybeObject*, Runtime_SetCode) {
     return Failure::Exception();
   }
 
+  // Mark both, the source and the target, as un-flushable because the
+  // shared unoptimized code makes them impossible to enqueue in a list.
+  ASSERT(target_shared->code()->gc_metadata() == NULL);
+  ASSERT(source_shared->code()->gc_metadata() == NULL);
+  target_shared->set_dont_flush(true);
+  source_shared->set_dont_flush(true);
+
   // Set the code, scope info, formal parameter count, and the length
   // of the target shared function info.  Set the source code of the
   // target function to undefined.  SetCode is only used for built-in
@@ -2590,9 +2592,8 @@ RUNTIME_FUNCTION(MaybeObject*, Runtime_SuspendJSGeneratorObject) {
 
   JavaScriptFrameIterator stack_iterator(isolate);
   JavaScriptFrame* frame = stack_iterator.frame();
-  JSFunction* function = JSFunction::cast(frame->function());
-  RUNTIME_ASSERT(function->shared()->is_generator());
-  ASSERT_EQ(function, generator_object->function());
+  RUNTIME_ASSERT(JSFunction::cast(frame->function())->shared()->is_generator());
+  ASSERT_EQ(JSFunction::cast(frame->function()), generator_object->function());
 
   // We expect there to be at least two values on the operand stack: the return
   // value of the yield expression, and the argument to this runtime call.
@@ -2602,6 +2603,8 @@ RUNTIME_FUNCTION(MaybeObject*, Runtime_SuspendJSGeneratorObject) {
   operands_count -= 2;
 
   if (operands_count == 0) {
+    // Although it's semantically harmless to call this function with an
+    // operands_count of zero, it is also unnecessary.
     ASSERT_EQ(generator_object->operand_stack(),
               isolate->heap()->empty_fixed_array());
     ASSERT_EQ(generator_object->stack_handler_index(), -1);
@@ -2618,20 +2621,7 @@ RUNTIME_FUNCTION(MaybeObject*, Runtime_SuspendJSGeneratorObject) {
     generator_object->set_stack_handler_index(stack_handler_index);
   }
 
-  // Set continuation down here to avoid side effects if the operand stack
-  // allocation fails.
-  intptr_t offset = frame->pc() - function->code()->instruction_start();
-  ASSERT(offset > 0 && Smi::IsValid(offset));
-  generator_object->set_continuation(static_cast<int>(offset));
-
-  // It's possible for the context to be other than the initial context even if
-  // there is no stack handler active.  For example, this is the case in the
-  // body of a "with" statement.  Therefore we always save the context.
-  generator_object->set_context(Context::cast(frame->context()));
-
-  // The return value is the hole for a suspend return, and anything else for a
-  // resume return.
-  return isolate->heap()->the_hole_value();
+  return isolate->heap()->undefined_value();
 }
 
 
@@ -2695,6 +2685,14 @@ RUNTIME_FUNCTION(MaybeObject*, Runtime_ThrowGeneratorStateError) {
   Vector< Handle<Object> > argv = HandleVector<Object>(NULL, 0);
   Handle<Object> error = isolate->factory()->NewError(message, argv);
   return isolate->Throw(*error);
+}
+
+
+RUNTIME_FUNCTION(MaybeObject*, Runtime_ObjectFreeze) {
+  NoHandleAllocation ha(isolate);
+  ASSERT(args.length() == 1);
+  CONVERT_ARG_CHECKED(JSObject, object, 0);
+  return object->Freeze(isolate);
 }
 
 
@@ -5653,11 +5651,10 @@ RUNTIME_FUNCTION(MaybeObject*, Runtime_URIEscape) {
   ASSERT(args.length() == 1);
   CONVERT_ARG_HANDLE_CHECKED(String, source, 0);
   Handle<String> string = FlattenGetString(source);
-  String::FlatContent content = string->GetFlatContent();
-  ASSERT(content.IsFlat());
-  Handle<String> result =
-      content.IsAscii() ? URIEscape::Escape<uint8_t>(isolate, source)
-                        : URIEscape::Escape<uc16>(isolate, source);
+  ASSERT(string->IsFlat());
+  Handle<String> result = string->IsOneByteRepresentationUnderneath()
+      ? URIEscape::Escape<uint8_t>(isolate, source)
+      : URIEscape::Escape<uc16>(isolate, source);
   if (result.is_null()) return Failure::OutOfMemoryException(0x12);
   return *result;
 }
@@ -5668,10 +5665,10 @@ RUNTIME_FUNCTION(MaybeObject*, Runtime_URIUnescape) {
   ASSERT(args.length() == 1);
   CONVERT_ARG_HANDLE_CHECKED(String, source, 0);
   Handle<String> string = FlattenGetString(source);
-  String::FlatContent content = string->GetFlatContent();
-  ASSERT(content.IsFlat());
-  return content.IsAscii() ? *URIUnescape::Unescape<uint8_t>(isolate, source)
-                           : *URIUnescape::Unescape<uc16>(isolate, source);
+  ASSERT(string->IsFlat());
+  return string->IsOneByteRepresentationUnderneath()
+      ? *URIUnescape::Unescape<uint8_t>(isolate, source)
+      : *URIUnescape::Unescape<uc16>(isolate, source);
 }
 
 
@@ -6200,6 +6197,7 @@ RUNTIME_FUNCTION(MaybeObject*, Runtime_StringToArray) {
       if (!maybe_obj->ToObject(&obj)) return maybe_obj;
     }
     elements = Handle<FixedArray>(FixedArray::cast(obj), isolate);
+    AssertNoAllocation no_gc;
     String::FlatContent content = s->GetFlatContent();
     if (content.IsAscii()) {
       Vector<const uint8_t> chars = content.ToOneByteVector();
@@ -7066,6 +7064,7 @@ static Object* FlatStringCompare(String* x, String* y) {
     equal_prefix_result = Smi::FromInt(LESS);
   }
   int r;
+  AssertNoAllocation no_gc;
   String::FlatContent x_content = x->GetFlatContent();
   String::FlatContent y_content = y->GetFlatContent();
   if (x_content.IsAscii()) {
@@ -7966,7 +7965,9 @@ RUNTIME_FUNCTION(MaybeObject*, Runtime_NotifyDeoptimized) {
   JavaScriptFrame* frame = it.frame();
   RUNTIME_ASSERT(frame->function()->IsJSFunction());
   Handle<JSFunction> function(JSFunction::cast(frame->function()), isolate);
-  RUNTIME_ASSERT(type != Deoptimizer::EAGER || function->IsOptimized());
+  Handle<Code> optimized_code(function->code());
+  RUNTIME_ASSERT((type != Deoptimizer::EAGER &&
+                  type != Deoptimizer::SOFT) || function->IsOptimized());
 
   // Avoid doing too much work when running with --always-opt and keep
   // the optimized code around.
@@ -8003,8 +8004,10 @@ RUNTIME_FUNCTION(MaybeObject*, Runtime_NotifyDeoptimized) {
   } else {
     Deoptimizer::DeoptimizeFunction(*function);
   }
-  // Flush optimized code cache for this function.
-  function->shared()->ClearOptimizedCodeMap();
+  // Evict optimized code for this function from the cache so that it doesn't
+  // get used for new closures.
+  function->shared()->EvictFromOptimizedCodeMap(*optimized_code,
+                                                "notify deoptimized");
 
   return isolate->heap()->undefined_value();
 }
@@ -8993,7 +8996,7 @@ RUNTIME_FUNCTION(MaybeObject*, Runtime_DebugPrint) {
 RUNTIME_FUNCTION(MaybeObject*, Runtime_DebugTrace) {
   NoHandleAllocation ha(isolate);
   ASSERT(args.length() == 0);
-  isolate->PrintStack();
+  isolate->PrintStack(stdout);
   return isolate->heap()->undefined_value();
 }
 
@@ -9213,26 +9216,6 @@ RUNTIME_FUNCTION(ObjectPair, Runtime_ResolvePossiblyDirectEval) {
                            args.at<Object>(2),
                            language_mode,
                            args.smi_at(4));
-}
-
-
-RUNTIME_FUNCTION(MaybeObject*, Runtime_SetNewFunctionAttributes) {
-  // This utility adjusts the property attributes for newly created Function
-  // object ("new Function(...)") by changing the map.
-  // All it does is changing the prototype property to enumerable
-  // as specified in ECMA262, 15.3.5.2.
-  HandleScope scope(isolate);
-  ASSERT(args.length() == 1);
-  CONVERT_ARG_HANDLE_CHECKED(JSFunction, func, 0);
-
-  Handle<Map> map = func->shared()->is_classic_mode()
-      ? isolate->function_instance_map()
-      : isolate->strict_mode_function_instance_map();
-
-  ASSERT(func->map()->instance_type() == map->instance_type());
-  ASSERT(func->map()->instance_size() == map->instance_size());
-  func->set_map(*map);
-  return *func;
 }
 
 
@@ -13121,7 +13104,7 @@ RUNTIME_FUNCTION(MaybeObject*, Runtime_Abort) {
   ASSERT(args.length() == 2);
   OS::PrintError("abort: %s\n",
                  reinterpret_cast<char*>(args[0]) + args.smi_at(1));
-  isolate->PrintStack();
+  isolate->PrintStack(stderr);
   OS::Abort();
   UNREACHABLE();
   return NULL;
@@ -13301,6 +13284,7 @@ RUNTIME_FUNCTION(MaybeObject*, Runtime_Log) {
   ASSERT(args.length() == 2);
   CONVERT_ARG_CHECKED(String, format, 0);
   CONVERT_ARG_CHECKED(JSArray, elms, 1);
+  AssertNoAllocation no_gc;
   String::FlatContent format_content = format->GetFlatContent();
   RUNTIME_ASSERT(format_content.IsAscii());
   Vector<const uint8_t> chars = format_content.ToOneByteVector();
@@ -13327,6 +13311,7 @@ ELEMENTS_KIND_CHECK_RUNTIME_FUNCTION(FastSmiOrObjectElements)
 ELEMENTS_KIND_CHECK_RUNTIME_FUNCTION(FastDoubleElements)
 ELEMENTS_KIND_CHECK_RUNTIME_FUNCTION(FastHoleyElements)
 ELEMENTS_KIND_CHECK_RUNTIME_FUNCTION(DictionaryElements)
+ELEMENTS_KIND_CHECK_RUNTIME_FUNCTION(NonStrictArgumentsElements)
 ELEMENTS_KIND_CHECK_RUNTIME_FUNCTION(ExternalPixelElements)
 ELEMENTS_KIND_CHECK_RUNTIME_FUNCTION(ExternalArrayElements)
 ELEMENTS_KIND_CHECK_RUNTIME_FUNCTION(ExternalByteElements)

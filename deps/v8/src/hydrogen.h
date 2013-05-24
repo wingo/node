@@ -277,17 +277,15 @@ class HGraph: public ZoneObject {
   void GlobalValueNumbering();
   bool ProcessArgumentsObject();
   void EliminateRedundantPhis();
-  void EliminateUnreachablePhis();
   void Canonicalize();
   void OrderBlocks();
   void AssignDominators();
   void SetupInformativeDefinitions();
   void EliminateRedundantBoundsChecks();
   void DehoistSimpleArrayIndexComputations();
-  void DeadCodeElimination();
   void RestoreActualValues();
+  void DeadCodeElimination(const char *phase_name);
   void PropagateDeoptimizingMark();
-  void EliminateUnusedInstructions();
 
   // Returns false if there are phi-uses of the arguments-object
   // which are not supported by the optimizing compiler.
@@ -389,6 +387,14 @@ class HGraph: public ZoneObject {
     return is_recursive_;
   }
 
+  void MarkDependsOnEmptyArrayProtoElements() {
+    depends_on_empty_array_proto_elements_ = true;
+  }
+
+  bool depends_on_empty_array_proto_elements() {
+    return depends_on_empty_array_proto_elements_;
+  }
+
   void RecordUint32Instruction(HInstruction* instr) {
     if (uint32_instructions_ == NULL) {
       uint32_instructions_ = new(zone()) ZoneList<HInstruction*>(4, zone());
@@ -402,6 +408,9 @@ class HGraph: public ZoneObject {
   HConstant* GetConstantSmi(SetOncePointer<HConstant>* pointer,
                             int32_t integer_value);
 
+  void MarkLive(HValue* ref, HValue* instr, ZoneList<HValue*>* worklist);
+  void MarkLiveInstructions();
+  void RemoveDeadInstructions();
   void MarkAsDeoptimizingRecursively(HBasicBlock* block);
   void NullifyUnreachableInstructions();
   void InsertTypeConversions(HInstruction* instr);
@@ -449,6 +458,7 @@ class HGraph: public ZoneObject {
   bool is_recursive_;
   bool use_optimistic_licm_;
   bool has_soft_deoptimize_;
+  bool depends_on_empty_array_proto_elements_;
   int type_change_checksum_;
 
   DISALLOW_COPY_AND_ASSIGN(HGraph);
@@ -982,11 +992,6 @@ class HGraphBuilder {
   HValue* BuildCheckMap(HValue* obj, Handle<Map> map);
 
   // Building common constructs
-  HLoadNamedField* DoBuildLoadNamedField(HValue* object,
-                                         bool inobject,
-                                         Representation representation,
-                                         int offset);
-
   HInstruction* BuildExternalArrayElementAccess(
       HValue* external_elements,
       HValue* checked_key,
@@ -1002,6 +1007,7 @@ class HGraphBuilder {
       HValue* dependency,
       ElementsKind elements_kind,
       bool is_store,
+      LoadKeyedHoleMode load_mode,
       KeyedAccessStoreMode store_mode);
 
   HValue* BuildCheckForCapacityGrow(HValue* object,
@@ -1024,11 +1030,28 @@ class HGraphBuilder {
       bool is_js_array,
       ElementsKind elements_kind,
       bool is_store,
+      LoadKeyedHoleMode load_mode,
       KeyedAccessStoreMode store_mode,
       Representation checked_index_representation = Representation::None());
 
-  HInstruction* BuildStoreMap(HValue* object, HValue* map);
-  HInstruction* BuildStoreMap(HValue* object, Handle<Map> map);
+  HLoadNamedField* AddLoad(
+      HValue *object,
+      HObjectAccess access,
+      HValue *typecheck = NULL,
+      Representation representation = Representation::Tagged());
+
+  HLoadNamedField* BuildLoadNamedField(
+      HValue* object,
+      HObjectAccess access,
+      Representation representation);
+
+  HStoreNamedField* AddStore(
+      HValue *object,
+      HObjectAccess access,
+      HValue *val,
+      Representation representation = Representation::Tagged());
+
+  HStoreNamedField* AddStoreMapConstant(HValue *object, Handle<Map>);
 
   HLoadNamedField* AddLoadElements(HValue *object, HValue *typecheck = NULL);
 
@@ -1680,9 +1703,6 @@ class HOptimizedGraphBuilder: public HGraphBuilder, public AstVisitor {
                                    bool is_store,
                                    bool* has_side_effects);
 
-  HLoadNamedField* BuildLoadNamedField(HValue* object,
-                                       Handle<Map> map,
-                                       LookupResult* result);
   HInstruction* BuildLoadNamedGeneric(HValue* object,
                                       Handle<String> name,
                                       Property* expr);

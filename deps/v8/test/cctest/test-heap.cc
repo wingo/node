@@ -2078,11 +2078,11 @@ TEST(OptimizedAllocationAlwaysInNewSpace) {
 // Test pretenuring of array literals allocated with HAllocate.
 TEST(OptimizedPretenuringArrayLiterals) {
   i::FLAG_allow_natives_syntax = true;
-  i::FLAG_pretenure_literals = true;
   CcTest::InitializeVM();
   if (!i::V8::UseCrankshaft() || i::FLAG_always_opt) return;
   if (i::FLAG_gc_global || i::FLAG_stress_compaction) return;
   v8::HandleScope scope(CcTest::isolate());
+  HEAP->SetNewSpaceHighPromotionModeActive(true);
 
   AlwaysAllocateScope always_allocate;
   v8::Local<v8::Value> res = CompileRun(
@@ -2104,7 +2104,7 @@ TEST(OptimizedPretenuringArrayLiterals) {
 
 TEST(OptimizedPretenuringSimpleArrayLiterals) {
   i::FLAG_allow_natives_syntax = true;
-  i::FLAG_pretenure_literals = false;
+  i::FLAG_pretenuring = false;
   CcTest::InitializeVM();
   if (!i::V8::UseCrankshaft() || i::FLAG_always_opt) return;
   if (i::FLAG_gc_global || i::FLAG_stress_compaction) return;
@@ -2805,6 +2805,13 @@ TEST(Regress169209) {
   i::FLAG_stress_compaction = false;
   i::FLAG_allow_natives_syntax = true;
   i::FLAG_flush_code_incrementally = true;
+
+  // Experimental natives are compiled during snapshot deserialization.
+  // This test breaks because heap layout changes in a way that closure
+  // is visited before shared function info.
+  i::FLAG_harmony_typed_arrays = false;
+  i::FLAG_harmony_array_buffer = false;
+
   CcTest::InitializeVM();
   Isolate* isolate = Isolate::Current();
   Heap* heap = isolate->heap();

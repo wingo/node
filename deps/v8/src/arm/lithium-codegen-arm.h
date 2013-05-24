@@ -126,6 +126,7 @@ class LCodeGen BASE_EMBEDDED {
   MemOperand ToHighMemOperand(LOperand* op) const;
 
   bool IsInteger32(LConstantOperand* op) const;
+  bool IsSmi(LConstantOperand* op) const;
   Handle<Object> ToHandle(LConstantOperand* op) const;
 
   // Try to generate code for the entire chunk, but it may fail if the
@@ -160,8 +161,7 @@ class LCodeGen BASE_EMBEDDED {
   void DoDeferredInstanceOfKnownGlobal(LInstanceOfKnownGlobal* instr,
                                        Label* map_check);
 
-  void DoCheckMapCommon(Register map_reg, Handle<Map> map,
-                        CompareMapMode mode, LEnvironment* env);
+  void DoCheckMapCommon(Register map_reg, Handle<Map> map, LEnvironment* env);
 
   // Parallel move support.
   void DoParallelMove(LParallelMove* move);
@@ -290,7 +290,11 @@ class LCodeGen BASE_EMBEDDED {
 
   void RegisterEnvironmentForDeoptimization(LEnvironment* environment,
                                             Safepoint::DeoptMode mode);
+  void DeoptimizeIf(Condition cc,
+                    LEnvironment* environment,
+                    Deoptimizer::BailoutType bailout_type);
   void DeoptimizeIf(Condition cc, LEnvironment* environment);
+  void SoftDeoptimize(LEnvironment* environment);
 
   void AddToTranslation(Translation* translation,
                         LOperand* op,
@@ -387,18 +391,6 @@ class LCodeGen BASE_EMBEDDED {
                                            Register scratch,
                                            LEnvironment* environment);
 
-  struct JumpTableEntry {
-    inline JumpTableEntry(Address entry, bool frame, bool is_lazy)
-        : label(),
-          address(entry),
-          needs_frame(frame),
-          is_lazy_deopt(is_lazy) { }
-    Label label;
-    Address address;
-    bool needs_frame;
-    bool is_lazy_deopt;
-  };
-
   void EnsureSpaceForLazyDeopt();
   void DoLoadKeyedExternalArray(LLoadKeyed* instr);
   void DoLoadKeyedFixedDoubleArray(LLoadKeyed* instr);
@@ -416,7 +408,7 @@ class LCodeGen BASE_EMBEDDED {
   int current_instruction_;
   const ZoneList<LInstruction*>* instructions_;
   ZoneList<LEnvironment*> deoptimizations_;
-  ZoneList<JumpTableEntry> deopt_jump_table_;
+  ZoneList<Deoptimizer::JumpTableEntry> deopt_jump_table_;
   ZoneList<Handle<Object> > deoptimization_literals_;
   ZoneList<Handle<Map> > prototype_maps_;
   ZoneList<Handle<Map> > transition_maps_;

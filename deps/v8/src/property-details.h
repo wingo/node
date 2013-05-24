@@ -39,7 +39,7 @@ enum PropertyAttributes {
   DONT_ENUM         = v8::DontEnum,
   DONT_DELETE       = v8::DontDelete,
 
-  SEALED            = DONT_ENUM | DONT_DELETE,
+  SEALED            = DONT_DELETE,
   FROZEN            = SEALED | READ_ONLY,
 
   SYMBOLIC          = 8,  // Used to filter symbol names
@@ -83,6 +83,7 @@ class Representation {
     kSmi,
     kInteger32,
     kDouble,
+    kHeapObject,
     kTagged,
     kExternal,
     kNumRepresentations
@@ -95,6 +96,7 @@ class Representation {
   static Representation Smi() { return Representation(kSmi); }
   static Representation Integer32() { return Representation(kInteger32); }
   static Representation Double() { return Representation(kDouble); }
+  static Representation HeapObject() { return Representation(kHeapObject); }
   static Representation External() { return Representation(kExternal); }
 
   static Representation FromKind(Kind kind) { return Representation(kind); }
@@ -111,6 +113,7 @@ class Representation {
   bool is_more_general_than(const Representation& other) const {
     ASSERT(kind_ != kExternal);
     ASSERT(other.kind_ != kExternal);
+    if (IsHeapObject()) return other.IsDouble();
     return kind_ > other.kind_;
   }
 
@@ -119,19 +122,19 @@ class Representation {
   }
 
   Representation generalize(Representation other) {
-    if (is_more_general_than(other)) {
-      return *this;
-    } else {
-      return other;
-    }
+    if (other.fits_into(*this)) return *this;
+    if (other.is_more_general_than(*this)) return other;
+    return Representation::Tagged();
   }
 
   Kind kind() const { return static_cast<Kind>(kind_); }
   bool IsNone() const { return kind_ == kNone; }
   bool IsTagged() const { return kind_ == kTagged; }
   bool IsSmi() const { return kind_ == kSmi; }
+  bool IsSmiOrTagged() const { return IsSmi() || IsTagged(); }
   bool IsInteger32() const { return kind_ == kInteger32; }
   bool IsDouble() const { return kind_ == kDouble; }
+  bool IsHeapObject() const { return kind_ == kHeapObject; }
   bool IsExternal() const { return kind_ == kExternal; }
   bool IsSpecialization() const {
     return kind_ == kInteger32 || kind_ == kDouble;
@@ -177,6 +180,11 @@ class PropertyDetails BASE_EMBEDDED {
 
   PropertyDetails CopyWithRepresentation(Representation representation) {
     return PropertyDetails(value_, representation);
+  }
+  PropertyDetails CopyAddAttributes(PropertyAttributes new_attributes) {
+    new_attributes =
+        static_cast<PropertyAttributes>(attributes() | new_attributes);
+    return PropertyDetails(value_, new_attributes);
   }
 
   // Conversion for storing details as Object*.
@@ -234,6 +242,9 @@ class PropertyDetails BASE_EMBEDDED {
   PropertyDetails(int value, Representation representation) {
     value_ = RepresentationField::update(
         value, EncodeRepresentation(representation));
+  }
+  PropertyDetails(int value, PropertyAttributes attributes) {
+    value_ = AttributesField::update(value, attributes);
   }
 
   uint32_t value_;

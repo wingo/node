@@ -157,6 +157,7 @@ void FullCodeGenerator::Generate() {
   __ movq(rbp, rsp);
   __ push(rsi);  // Callee's context.
   __ push(rdi);  // Callee's JS Function.
+  info->AddNoFrameRange(0, masm_->pc_offset());
 
   { Comment cmnt(masm_, "[ Allocate locals");
     int locals_count = info->scope()->num_stack_slots();
@@ -406,6 +407,7 @@ void FullCodeGenerator::EmitReturnSequence() {
     // patch with the code required by the debugger.
     __ movq(rsp, rbp);
     __ pop(rbp);
+    int no_frame_start = masm_->pc_offset();
 
     int arguments_bytes = (info_->scope()->num_parameters() + 1) * kPointerSize;
     __ Ret(arguments_bytes, rcx);
@@ -423,6 +425,7 @@ void FullCodeGenerator::EmitReturnSequence() {
     ASSERT(Assembler::kJSReturnSequenceLength <=
            masm_->SizeOfCodeGeneratedSince(&check_exit_codesize));
 #endif
+    info_->AddNoFrameRange(no_frame_start, masm_->pc_offset());
   }
 }
 
@@ -1044,9 +1047,8 @@ void FullCodeGenerator::VisitForInStatement(ForInStatement* stmt) {
   ForIn loop_statement(this, stmt);
   increment_loop_depth();
 
-  // Get the object to enumerate over. Both SpiderMonkey and JSC
-  // ignore null and undefined in contrast to the specification; see
-  // ECMA-262 section 12.6.4.
+  // Get the object to enumerate over. If the object is null or undefined, skip
+  // over the loop.  See ECMA-262 version 5, section 12.6.4.
   VisitForAccumulatorValue(stmt->enumerable());
   __ CompareRoot(rax, Heap::kUndefinedValueRootIndex);
   __ j(equal, &exit);
@@ -1218,6 +1220,55 @@ void FullCodeGenerator::VisitForInStatement(ForInStatement* stmt) {
   // Exit and decrement the loop depth.
   PrepareForBailoutForId(stmt->ExitId(), NO_REGISTERS);
   __ bind(&exit);
+  decrement_loop_depth();
+}
+
+
+void FullCodeGenerator::VisitForOfStatement(ForOfStatement* stmt) {
+  Comment cmnt(masm_, "[ ForOfStatement");
+  SetStatementPosition(stmt);
+
+  Iteration loop_statement(this, stmt);
+  increment_loop_depth();
+
+  // var iterator = iterable[@@iterator]()
+  VisitForAccumulatorValue(stmt->assign_iterator());
+
+  // As with for-in, skip the loop if the iterator is null or undefined.
+  __ CompareRoot(rax, Heap::kUndefinedValueRootIndex);
+  __ j(equal, loop_statement.break_label());
+  __ CompareRoot(rax, Heap::kNullValueRootIndex);
+  __ j(equal, loop_statement.break_label());
+
+  // Loop entry.
+  __ bind(loop_statement.continue_label());
+
+  // result = iterator.next()
+  VisitForEffect(stmt->next_result());
+
+  // if (result.done) break;
+  Label result_not_done;
+  VisitForControl(stmt->result_done(),
+                  loop_statement.break_label(),
+                  &result_not_done,
+                  &result_not_done);
+  __ bind(&result_not_done);
+
+  PrepareForBailoutForId(stmt->BodyId(), NO_REGISTERS);
+
+  // each = result.value
+  VisitForEffect(stmt->assign_each());
+
+  // Generate code for the body of the loop.
+  Visit(stmt->body());
+
+  // Loop.
+  EmitBackEdgeBookkeeping(stmt, loop_statement.continue_label());
+  __ jmp(loop_statement.continue_label());
+
+  // Exit and decrement the loop depth.
+  PrepareForBailoutForId(stmt->ExitId(), NO_REGISTERS);
+  __ bind(loop_statement.break_label());
   decrement_loop_depth();
 }
 
@@ -1917,14 +1968,31 @@ void FullCodeGenerator::VisitYield(Yield* expr) {
   switch (expr->yield_kind()) {
     case Yield::INITIAL:
     case Yield::SUSPEND: {
-      VisitForStackValue(expr->generator_object());
+      Label suspend, continuation, post_runtime, resume;
+
+      __ jmp(&suspend);
+
+      __ bind(&continuation);
+      __ jmp(&resume);
+
+      __ bind(&suspend);
+      VisitForAccumulatorValue(expr->generator_object());
+      ASSERT(continuation.pos() > 0 && Smi::IsValid(continuation.pos()));
+      __ Move(FieldOperand(rax, JSGeneratorObject::kContinuationOffset),
+              Smi::FromInt(continuation.pos()));
+      __ movq(FieldOperand(rax, JSGeneratorObject::kContextOffset), rsi);
+      __ movq(rcx, rsi);
+      __ RecordWriteField(rax, JSGeneratorObject::kContextOffset, rcx, rdx,
+                          kDontSaveFPRegs);
+      __ lea(rbx, Operand(rbp, StandardFrameConstants::kExpressionsOffset));
+      __ cmpq(rsp, rbx);
+      __ j(equal, &post_runtime);
+      __ push(rax);  // generator object
       __ CallRuntime(Runtime::kSuspendJSGeneratorObject, 1);
       __ movq(context_register(),
               Operand(rbp, StandardFrameConstants::kContextOffset));
+      __ bind(&post_runtime);
 
-      Label resume;
-      __ CompareRoot(result_register(), Heap::kTheHoleValueRootIndex);
-      __ j(not_equal, &resume);
       if (expr->yield_kind() == Yield::SUSPEND) {
         EmitReturnIteratorResult(false);
       } else {
@@ -1946,8 +2014,107 @@ void FullCodeGenerator::VisitYield(Yield* expr) {
       break;
     }
 
-    case Yield::DELEGATING:
-      UNIMPLEMENTED();
+    case Yield::DELEGATING: {
+      VisitForStackValue(expr->generator_object());
+
+      // Initial stack layout is as follows:
+      // [sp + 1 * kPointerSize] iter
+      // [sp + 0 * kPointerSize] g
+
+      Label l_catch, l_try, l_suspend, l_continuation, l_resume;
+      Label l_send, l_call, l_loop;
+      // Initial send value is undefined.
+      __ LoadRoot(rax, Heap::kUndefinedValueRootIndex);
+      __ jmp(&l_send);
+
+      // catch (e) { receiver = iter; f = iter.throw; arg = e; goto l_call; }
+      __ bind(&l_catch);
+      handler_table()->set(expr->index(), Smi::FromInt(l_catch.pos()));
+      __ movq(rcx, Operand(rsp, 1 * kPointerSize));      // iter
+      __ push(rcx);                                      // iter
+      __ push(rax);                                      // exception
+      __ movq(rax, rcx);                                 // iter
+      __ LoadRoot(rcx, Heap::kthrow_stringRootIndex);    // "throw"
+      Handle<Code> throw_ic = isolate()->builtins()->LoadIC_Initialize();
+      CallIC(throw_ic);                                  // iter.throw in rax
+      __ jmp(&l_call);
+
+      // try { received = yield result.value }
+      __ bind(&l_try);
+      __ pop(rax);                                       // result.value
+      __ PushTryHandler(StackHandler::CATCH, expr->index());
+      const int handler_size = StackHandlerConstants::kSize;
+      __ push(rax);                                      // result.value
+      __ jmp(&l_suspend);
+      __ bind(&l_continuation);
+      __ jmp(&l_resume);
+      __ bind(&l_suspend);
+      __ movq(rax, Operand(rsp, (0 + 1) * kPointerSize + handler_size));  // g
+      __ push(rax);                                      // g
+      ASSERT(l_continuation.pos() > 0 && Smi::IsValid(l_continuation.pos()));
+      __ Move(FieldOperand(rax, JSGeneratorObject::kContinuationOffset),
+              Smi::FromInt(l_continuation.pos()));
+      __ movq(FieldOperand(rax, JSGeneratorObject::kContextOffset), rsi);
+      __ movq(rcx, rsi);
+      __ RecordWriteField(rax, JSGeneratorObject::kContextOffset, rcx, rdx,
+                          kDontSaveFPRegs);
+      __ CallRuntime(Runtime::kSuspendJSGeneratorObject, 1);
+      __ movq(context_register(),
+              Operand(rbp, StandardFrameConstants::kContextOffset));
+      EmitReturnIteratorResult(false);
+      __ bind(&l_resume);                                // received in rax
+      __ PopTryHandler();
+
+      // receiver = iter; f = iter.send; arg = received;
+      __ bind(&l_send);
+      __ movq(rcx, Operand(rsp, 1 * kPointerSize));      // iter
+      __ push(rcx);                                      // iter
+      __ push(rax);                                      // received
+      __ movq(rax, rcx);                                 // iter
+      __ LoadRoot(rcx, Heap::ksend_stringRootIndex);     // "send"
+      Handle<Code> send_ic = isolate()->builtins()->LoadIC_Initialize();
+      CallIC(send_ic);                                   // iter.send in rax
+
+      // result = f.call(receiver, arg);
+      __ bind(&l_call);
+      Label l_call_runtime;
+      __ JumpIfSmi(rax, &l_call_runtime);
+      __ CmpObjectType(rax, JS_FUNCTION_TYPE, rbx);
+      __ j(not_equal, &l_call_runtime);
+      __ movq(rdi, rax);
+      ParameterCount count(1);
+      __ InvokeFunction(rdi, count, CALL_FUNCTION,
+                        NullCallWrapper(), CALL_AS_METHOD);
+      __ movq(rsi, Operand(rbp, StandardFrameConstants::kContextOffset));
+      __ jmp(&l_loop);
+      __ bind(&l_call_runtime);
+      __ push(rax);
+      __ CallRuntime(Runtime::kCall, 3);
+
+      // val = result.value; if (!result.done) goto l_try;
+      __ bind(&l_loop);
+      // result.value
+      __ push(rax);                                      // save result
+      __ LoadRoot(rcx, Heap::kvalue_stringRootIndex);    // "value"
+      Handle<Code> value_ic = isolate()->builtins()->LoadIC_Initialize();
+      CallIC(value_ic);                                  // result.value in rax
+      __ pop(rbx);                                       // result
+      __ push(rax);                                      // result.value
+      __ movq(rax, rbx);                                 // result
+      __ LoadRoot(rcx, Heap::kdone_stringRootIndex);     // "done"
+      Handle<Code> done_ic = isolate()->builtins()->LoadIC_Initialize();
+      CallIC(done_ic);                                   // result.done in rax
+      ToBooleanStub stub(rax);
+      __ push(rax);
+      __ CallStub(&stub);
+      __ testq(rax, rax);
+      __ j(zero, &l_try);
+
+      // result.value
+      __ pop(rax);                                       // result.value
+      context()->DropAndPlug(2, rax);                    // drop iter and g
+      break;
+    }
   }
 }
 
@@ -3254,19 +3421,54 @@ void FullCodeGenerator::EmitDateField(CallRuntime* expr) {
 }
 
 
+void FullCodeGenerator::EmitSeqStringSetCharCheck(Register string,
+                                                  Register index,
+                                                  Register value,
+                                                  uint32_t encoding_mask) {
+  __ Check(masm()->CheckSmi(index), "Non-smi index");
+  __ Check(masm()->CheckSmi(value), "Non-smi value");
+
+  __ SmiCompare(index, FieldOperand(string, String::kLengthOffset));
+  __ Check(less, "Index is too large");
+
+  __ SmiCompare(index, Smi::FromInt(0));
+  __ Check(greater_equal, "Index is negative");
+
+  __ push(value);
+  __ movq(value, FieldOperand(string, HeapObject::kMapOffset));
+  __ movzxbq(value, FieldOperand(value, Map::kInstanceTypeOffset));
+
+  __ andb(value, Immediate(kStringRepresentationMask | kStringEncodingMask));
+  __ cmpq(value, Immediate(encoding_mask));
+  __ Check(equal, "Unexpected string type");
+  __ pop(value);
+}
+
+
 void FullCodeGenerator::EmitOneByteSeqStringSetChar(CallRuntime* expr) {
   ZoneList<Expression*>* args = expr->arguments();
   ASSERT_EQ(3, args->length());
 
+  Register string = rax;
+  Register index = rbx;
+  Register value = rcx;
+
   VisitForStackValue(args->at(1));  // index
   VisitForStackValue(args->at(2));  // value
-  __ pop(rcx);
-  __ pop(rbx);
+  __ pop(value);
+  __ pop(index);
   VisitForAccumulatorValue(args->at(0));  // string
 
-  static const String::Encoding encoding = String::ONE_BYTE_ENCODING;
-  SeqStringSetCharGenerator::Generate(masm_, encoding, rax, rbx, rcx);
-  context()->Plug(rax);
+  if (FLAG_debug_code) {
+    static const uint32_t one_byte_seq_type = kSeqStringTag | kOneByteStringTag;
+    EmitSeqStringSetCharCheck(string, index, value, one_byte_seq_type);
+  }
+
+  __ SmiToInteger32(value, value);
+  __ SmiToInteger32(index, index);
+  __ movb(FieldOperand(string, index, times_1, SeqOneByteString::kHeaderSize),
+          value);
+  context()->Plug(string);
 }
 
 
@@ -3274,14 +3476,25 @@ void FullCodeGenerator::EmitTwoByteSeqStringSetChar(CallRuntime* expr) {
   ZoneList<Expression*>* args = expr->arguments();
   ASSERT_EQ(3, args->length());
 
+  Register string = rax;
+  Register index = rbx;
+  Register value = rcx;
+
   VisitForStackValue(args->at(1));  // index
   VisitForStackValue(args->at(2));  // value
-  __ pop(rcx);
-  __ pop(rbx);
+  __ pop(value);
+  __ pop(index);
   VisitForAccumulatorValue(args->at(0));  // string
 
-  static const String::Encoding encoding = String::TWO_BYTE_ENCODING;
-  SeqStringSetCharGenerator::Generate(masm_, encoding, rax, rbx, rcx);
+  if (FLAG_debug_code) {
+    static const uint32_t two_byte_seq_type = kSeqStringTag | kTwoByteStringTag;
+    EmitSeqStringSetCharCheck(string, index, value, two_byte_seq_type);
+  }
+
+  __ SmiToInteger32(value, value);
+  __ SmiToInteger32(index, index);
+  __ movw(FieldOperand(string, index, times_2, SeqTwoByteString::kHeaderSize),
+          value);
   context()->Plug(rax);
 }
 

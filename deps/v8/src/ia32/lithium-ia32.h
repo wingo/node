@@ -50,7 +50,6 @@ class LCodeGen;
   V(ArgumentsLength)                            \
   V(ArithmeticD)                                \
   V(ArithmeticT)                                \
-  V(ArrayLiteral)                               \
   V(BitI)                                       \
   V(BitNotI)                                    \
   V(BoundsCheck)                                \
@@ -71,6 +70,7 @@ class LCodeGen;
   V(CheckNonSmi)                                \
   V(CheckPrototypeMaps)                         \
   V(CheckSmi)                                   \
+  V(CheckSmiAndReturn)                          \
   V(ClampDToUint8)                              \
   V(ClampIToUint8)                              \
   V(ClampTToUint8)                              \
@@ -85,11 +85,13 @@ class LCodeGen;
   V(ConstantI)                                  \
   V(ConstantT)                                  \
   V(Context)                                    \
+  V(DebugBreak)                                 \
   V(DeclareGlobals)                             \
   V(DeleteProperty)                             \
   V(Deoptimize)                                 \
   V(DivI)                                       \
   V(DoubleToI)                                  \
+  V(DoubleToSmi)                                \
   V(DummyUse)                                   \
   V(ElementsKind)                               \
   V(FixedArrayBaseLength)                       \
@@ -106,10 +108,10 @@ class LCodeGen;
   V(InstanceSize)                               \
   V(InstructionGap)                             \
   V(Integer32ToDouble)                          \
+  V(Integer32ToSmi)                             \
   V(Uint32ToDouble)                             \
   V(InvokeFunction)                             \
   V(IsConstructCallAndBranch)                   \
-  V(IsNilAndBranch)                             \
   V(IsObjectAndBranch)                          \
   V(IsStringAndBranch)                          \
   V(IsSmiAndBranch)                             \
@@ -145,7 +147,6 @@ class LCodeGen;
   V(NumberTagI)                                 \
   V(NumberTagU)                                 \
   V(NumberUntagD)                               \
-  V(ObjectLiteral)                              \
   V(OsrEntry)                                   \
   V(OuterContext)                               \
   V(Parameter)                                  \
@@ -572,6 +573,12 @@ class LArgumentsElements: public LTemplateInstruction<1, 0, 0> {
 };
 
 
+class LDebugBreak: public LTemplateInstruction<0, 0, 0> {
+ public:
+  DECLARE_CONCRETE_INSTRUCTION(DebugBreak, "break")
+};
+
+
 class LModI: public LTemplateInstruction<1, 2, 1> {
  public:
   LModI(LOperand* left, LOperand* right, LOperand* temp) {
@@ -831,26 +838,6 @@ class LCmpConstantEqAndBranch: public LControlInstruction<1, 0> {
   DECLARE_CONCRETE_INSTRUCTION(CmpConstantEqAndBranch,
                                "cmp-constant-eq-and-branch")
   DECLARE_HYDROGEN_ACCESSOR(CompareConstantEqAndBranch)
-};
-
-
-class LIsNilAndBranch: public LControlInstruction<1, 1> {
- public:
-  LIsNilAndBranch(LOperand* value, LOperand* temp) {
-    inputs_[0] = value;
-    temps_[0] = temp;
-  }
-
-  LOperand* value() { return inputs_[0]; }
-  LOperand* temp() { return temps_[0]; }
-
-  DECLARE_CONCRETE_INSTRUCTION(IsNilAndBranch, "is-nil-and-branch")
-  DECLARE_HYDROGEN_ACCESSOR(IsNilAndBranch)
-
-  EqualityKind kind() const { return hydrogen()->kind(); }
-  NilValue nil() const { return hydrogen()->nil(); }
-
-  virtual void PrintDataTo(StringStream* stream);
 };
 
 
@@ -1609,7 +1596,7 @@ inline static bool ExternalArrayOpRequiresTemp(
   // Operations that require the key to be divided by two to be converted into
   // an index cannot fold the scale operation into a load and need an extra
   // temp register to do the work.
-  return key_representation.IsTagged() &&
+  return key_representation.IsSmi() &&
       (elements_kind == EXTERNAL_BYTE_ELEMENTS ||
        elements_kind == EXTERNAL_UNSIGNED_BYTE_ELEMENTS ||
        elements_kind == EXTERNAL_PIXEL_ELEMENTS);
@@ -2014,6 +2001,19 @@ class LInteger32ToDouble: public LTemplateInstruction<1, 1, 0> {
 };
 
 
+class LInteger32ToSmi: public LTemplateInstruction<1, 1, 0> {
+ public:
+  explicit LInteger32ToSmi(LOperand* value) {
+    inputs_[0] = value;
+  }
+
+  LOperand* value() { return inputs_[0]; }
+
+  DECLARE_CONCRETE_INSTRUCTION(Integer32ToSmi, "int32-to-smi")
+  DECLARE_HYDROGEN_ACCESSOR(Change)
+};
+
+
 class LUint32ToDouble: public LTemplateInstruction<1, 1, 1> {
  public:
   explicit LUint32ToDouble(LOperand* value, LOperand* temp) {
@@ -2082,6 +2082,19 @@ class LDoubleToI: public LTemplateInstruction<1, 1, 1> {
   DECLARE_HYDROGEN_ACCESSOR(UnaryOperation)
 
   bool truncating() { return hydrogen()->CanTruncateToInt32(); }
+};
+
+
+class LDoubleToSmi: public LTemplateInstruction<1, 1, 0> {
+ public:
+  explicit LDoubleToSmi(LOperand* value) {
+    inputs_[0] = value;
+  }
+
+  LOperand* value() { return inputs_[0]; }
+
+  DECLARE_CONCRETE_INSTRUCTION(DoubleToSmi, "double-to-smi")
+  DECLARE_HYDROGEN_ACCESSOR(UnaryOperation)
 };
 
 
@@ -2199,9 +2212,6 @@ class LStoreNamedField: public LTemplateInstruction<0, 2, 2> {
 
   virtual void PrintDataTo(StringStream* stream);
 
-  Handle<Object> name() const { return hydrogen()->name(); }
-  bool is_in_object() { return hydrogen()->is_in_object(); }
-  int offset() { return hydrogen()->offset(); }
   Handle<Map> transition() const { return hydrogen()->transition(); }
   Representation representation() const {
     return hydrogen()->field_representation();
@@ -2460,6 +2470,18 @@ class LCheckSmi: public LTemplateInstruction<0, 1, 0> {
 };
 
 
+class LCheckSmiAndReturn: public LTemplateInstruction<1, 1, 0> {
+ public:
+  explicit LCheckSmiAndReturn(LOperand* value) {
+    inputs_[0] = value;
+  }
+
+  LOperand* value() { return inputs_[0]; }
+
+  DECLARE_CONCRETE_INSTRUCTION(CheckSmiAndReturn, "check-smi-and-return")
+};
+
+
 class LClampDToUint8: public LTemplateInstruction<1, 1, 0> {
  public:
   explicit LClampDToUint8(LOperand* value) {
@@ -2562,32 +2584,6 @@ class LAllocate: public LTemplateInstruction<1, 2, 1> {
 
   DECLARE_CONCRETE_INSTRUCTION(Allocate, "allocate")
   DECLARE_HYDROGEN_ACCESSOR(Allocate)
-};
-
-
-class LArrayLiteral: public LTemplateInstruction<1, 1, 0> {
- public:
-  explicit LArrayLiteral(LOperand* context) {
-    inputs_[0] = context;
-  }
-
-  LOperand* context() { return inputs_[0]; }
-
-  DECLARE_CONCRETE_INSTRUCTION(ArrayLiteral, "array-literal")
-  DECLARE_HYDROGEN_ACCESSOR(ArrayLiteral)
-};
-
-
-class LObjectLiteral: public LTemplateInstruction<1, 1, 0> {
- public:
-  explicit LObjectLiteral(LOperand* context) {
-    inputs_[0] = context;
-  }
-
-  LOperand* context() { return inputs_[0]; }
-
-  DECLARE_CONCRETE_INSTRUCTION(ObjectLiteral, "object-literal")
-  DECLARE_HYDROGEN_ACCESSOR(ObjectLiteral)
 };
 
 
